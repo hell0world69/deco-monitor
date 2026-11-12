@@ -12,6 +12,9 @@ Usage:
   deco raw PATH JSON    send an arbitrary request, e.g.
                         deco raw 'admin/device?form=device_list' '{"operation":"read"}'
   deco logout           drop the cached session
+  deco tmp OPCODE [JSON --write] [--force]
+                        talk the phone app's local protocol (SSH port 20001);
+                        needs the TP-Link ID email in the keyring (service deco-monitor-email)
 
 Password lookup order: $DECO_PASSWORD, then the GNOME keyring entry
 (secret-tool lookup service deco-monitor), then ~/.config/deco-monitor/password.
@@ -205,6 +208,180 @@ class Deco:
         return res.get("result", {})
 
 
+# ---------- TMP: the phone app's local protocol (SSH port 20001) ----------
+#
+# The Deco app manages the Deco over SSH (dropbear, port 20001): it opens a
+# direct-tcpip channel to the TMP daemon at 127.0.0.1:20002 inside the Deco
+# and speaks binary-framed JSON addressed by opcodes. Framing follows
+# pydeco-tmp (github.com/mthsg/pydeco-tmp, MIT): SSH user is
+# hex(SHA-1(TP-Link ID email)), password is the TP-Link ID password.
+# `ssh -W` gives us that channel on stdin/stdout, so no SSH library is needed.
+#
+# The Deco locks SSH logins for 120 minutes after 10 failures, so a failed
+# login is recorded and further attempts are refused for two hours unless
+# forced.
+
+import select
+import struct
+import zlib
+
+TMP_FAIL = os.path.join(os.path.expanduser("~/.local/state/deco-monitor"), "tmp-login-failed")
+TMP_KNOWN_HOSTS = os.path.join(os.path.expanduser("~/.local/state/deco-monitor"), "known_hosts")
+
+
+def get_email() -> str:
+    em = os.environ.get("DECO_EMAIL")
+    if em:
+        return em.strip()
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "service", "deco-monitor-email"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    path = os.path.expanduser("~/.config/deco-monitor/email")
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.read().strip()
+    raise DecoError("no TP-Link ID email: run  secret-tool store --label='Deco TP-Link ID email' service deco-monitor-email")
+
+
+class Tmp:
+    def __init__(self, force=False, timeout=10):
+        self.timeout = timeout
+        if not force and os.path.exists(TMP_FAIL) and time.time() - os.path.getmtime(TMP_FAIL) < 7200:
+            raise DecoError("a TMP login failed less than 2 hours ago; refusing to risk the Deco's "
+                            "login lockout (delete ~/.local/state/deco-monitor/tmp-login-failed or use --force)")
+        os.makedirs(os.path.dirname(TMP_FAIL), exist_ok=True)
+        user = hashlib.sha1(get_email().encode()).hexdigest()
+        askpass = os.path.join(os.path.dirname(os.path.realpath(__file__)), "deco")
+        env = dict(os.environ, SSH_ASKPASS=askpass, SSH_ASKPASS_REQUIRE="force",
+                   DECO_ASKPASS="1", DISPLAY=os.environ.get("DISPLAY", ":0"))
+        self.proc = subprocess.Popen(
+            ["ssh", "-p", "20001", "-T", "-x", "-a",
+             "-o", f"UserKnownHostsFile={TMP_KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
+             "-o", "NumberOfPasswordPrompts=1", "-o", f"ConnectTimeout={timeout}",
+             "-o", "LogLevel=ERROR",
+             "-W", "127.0.0.1:20002", f"{user}@{HOST}"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.seq = 1
+        self.txid = 0
+        try:
+            self.token = self.request(1).decode("ascii", "replace")
+        except DecoError as e:
+            err = self._stderr()
+            if "Permission denied" in err:
+                with open(TMP_FAIL, "w") as f:
+                    f.write(err)
+                raise DecoError("TMP login refused: " + err.strip().splitlines()[-1][:200])
+            raise DecoError(f"{e}; ssh: {err.strip()[:300]}")
+        try:
+            os.unlink(TMP_FAIL)
+        except OSError:
+            pass
+
+    def _stderr(self):
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.close()
+        return self.proc.stderr.read().decode(errors="replace")
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+    def _send(self, data):
+        try:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+        except BrokenPipeError:
+            raise DecoError("TMP channel closed")
+
+    def _recvn(self, n):
+        buf = b""
+        fd = self.proc.stdout.fileno()
+        while len(buf) < n:
+            r, _, _ = select.select([fd], [], [], self.timeout)
+            if not r:
+                raise DecoError("TMP timeout")
+            chunk = os.read(fd, n - len(buf))
+            if not chunk:
+                raise DecoError("TMP channel closed")
+            buf += chunk
+        return buf
+
+    @staticmethod
+    def _tmp5(payload, seq):
+        base = struct.pack(">BBBBHBBI", 1, 1, 5, 0, len(payload), 0, 0, seq)
+        crc = zlib.crc32(base + struct.pack(">I", 0x5A6B7C8D) + payload) & 0xFFFFFFFF
+        return base + struct.pack(">I", crc) + payload
+
+    @staticmethod
+    def _biz(opcode, ptype, body, txid, offset=0):
+        crc = zlib.crc32(body) & 0xFFFFFFFF if body else 0
+        return struct.pack(">BBHBBHIII", 1, 2, opcode, ptype, 0, txid, crc, len(body), offset) + body
+
+    def _read_tmp5(self):
+        while True:
+            head = self._recvn(4)
+            typ = head[2]
+            if typ == 4:          # keep-alive: echo it
+                self._send(bytes([1, 1, 4, 0]))
+                continue
+            if typ == 2:          # stray connection ack
+                continue
+            if typ == 5:
+                rest = self._recvn(12)
+                length = struct.unpack(">H", (head + rest)[4:6])[0]
+                return self._recvn(length)
+            raise DecoError(f"unexpected TMP type {typ}")
+
+    def request(self, opcode, params=None):
+        tx = self.txid
+        self.txid = (self.txid + 1) & 0xFFFF
+        body = b""
+        if opcode != 1:
+            payload = {"config_version": int(time.time() * 1000)}
+            if params is not None:
+                payload["params"] = params
+            body = json.dumps(payload, separators=(",", ":")).encode()
+        self._send(self._tmp5(self._biz(opcode, 2, body, tx), self.seq))
+        self.seq += 1
+        data = bytearray()
+        while True:
+            p = self._read_tmp5()
+            _, _, op, ptype, err, rtx, _, total, _ = struct.unpack_from(">BBHBBHIII", p, 0)
+            if rtx != tx:
+                continue
+            if err != 0:
+                raise DecoError(f"TMP business error {err} (opcode 0x{opcode:04x})")
+            if ptype != 5:
+                raise DecoError(f"TMP unexpected ptype {ptype}")
+            data += p[20:]
+            if total == 0 or len(data) >= total:
+                break
+            self._send(self._tmp5(self._biz(opcode, 4, b"", tx, offset=len(data)), self.seq))
+            self.seq += 1
+        return bytes(data)
+
+    def call(self, opcode, params=None):
+        raw = self.request(opcode, params)
+        if not raw:
+            return None
+        doc = json.loads(raw.decode("utf-8", "replace"))
+        ec = doc.get("error_code")
+        if ec not in (None, 0):
+            raise DecoError(f"TMP error_code {ec} (opcode 0x{opcode:04x})")
+        return doc.get("result", doc)
+
+
 # ---------- data shaping ----------
 
 def b64name(s):
@@ -372,6 +549,21 @@ def main(argv):
         macs = argv[2:] or [n["mac"] for n in nodes(d)]
         r = d.request("admin/device?form=system",
                       {"operation": "reboot", "params": {"mac_list": [{"mac": m} for m in macs]}})
+    elif cmd == "tmp" and len(argv) >= 3:
+        # deco tmp OPCODE            read (e.g. 0x4018)
+        # deco tmp OPCODE JSON --write   write params (changes the Deco)
+        force = "--force" in argv
+        args = [a for a in argv[2:] if not a.startswith("--")]
+        opcode = int(args[0], 0)
+        params = json.loads(args[1]) if len(args) > 1 else None
+        if params is not None and "--write" not in argv:
+            print("refusing to send params without --write (it changes the Deco)", file=sys.stderr)
+            return 2
+        t = Tmp(force=force)
+        try:
+            r = t.call(opcode, params)
+        finally:
+            t.close()
     elif cmd == "raw" and len(argv) == 4:
         r = d.request(argv[2], json.loads(argv[3]))
     elif cmd == "logout":
@@ -388,6 +580,13 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if os.environ.get("DECO_ASKPASS") == "1" and len(sys.argv) <= 2:
+        # Invoked by ssh as SSH_ASKPASS: print the password, nothing else.
+        try:
+            print(get_password())
+        except DecoError:
+            sys.exit(1)
+        sys.exit(0)
     try:
         sys.exit(main(sys.argv))
     except DecoError as e:
