@@ -1,0 +1,13 @@
+[Unit]
+Description=Deco Monitor: poll the TP-Link Deco mesh for the bar widget and decomon
+After=graphical-session.target network-online.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/deco watch 3
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

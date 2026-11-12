@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Deco Monitor
+Comment=Watch your home network: live speeds, devices and Deco units
+Exec=decomon
+Icon=decomon
+Terminal=false
+Categories=Network;Monitor;
+Keywords=deco;router;wifi;network;bandwidth;
+StartupWMClass=decomon

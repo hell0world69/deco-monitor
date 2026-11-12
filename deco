@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""deco - talk to a TP-Link Deco mesh over its local web API.
+
+Usage:
+  deco clients          connected devices (JSON)
+  deco nodes            Deco units (JSON)
+  deco wan              internet connection info (JSON)
+  deco status           everything above in one call (JSON)
+  deco watch [SECONDS]  poll forever, writing $XDG_RUNTIME_DIR/deco-monitor/status.json
+                        and sending a desktop notification when a new device joins
+  deco reboot [MAC..]   reboot all Deco units, or the given ones
+  deco raw PATH JSON    send an arbitrary request, e.g.
+                        deco raw 'admin/device?form=device_list' '{"operation":"read"}'
+  deco logout           drop the cached session
+
+Password lookup order: $DECO_PASSWORD, then the GNOME keyring entry
+(secret-tool lookup service deco-monitor), then ~/.config/deco-monitor/password.
+Host: $DECO_HOST (default 192.168.68.1).
+"""
+import base64
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from http.cookiejar import CookieJar
+
+HOST = os.environ.get("DECO_HOST", "192.168.68.1")
+BASE = f"http://{HOST}/cgi-bin/luci/;stok="
+CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "deco-monitor-session.json")
+TIMEOUT = 8
+
+
+class DecoError(Exception):
+    pass
+
+
+# ---------- crypto helpers (no third-party deps) ----------
+
+def rsa_encrypt(n: int, e: int, data: bytes) -> str:
+    """PKCS#1 v1.5 RSA, chunked; returns concatenated hex."""
+    k = (n.bit_length() + 7) // 8
+    out = []
+    for i in range(0, len(data), k - 11):
+        chunk = data[i:i + k - 11]
+        pad_len = k - 3 - len(chunk)
+        pad = bytes(secrets.choice(range(1, 256)) for _ in range(pad_len))
+        block = b"\x00\x02" + pad + b"\x00" + chunk
+        c = pow(int.from_bytes(block, "big"), e, n)
+        out.append(c.to_bytes(k, "big").hex())
+    return "".join(out)
+
+
+def _openssl_aes(args, key: bytes, iv: bytes, data: bytes) -> bytes:
+    r = subprocess.run(
+        ["openssl", "enc", "-aes-128-cbc", *args, "-K", key.hex(), "-iv", iv.hex()],
+        input=data, capture_output=True,
+    )
+    if r.returncode != 0:
+        raise DecoError("AES failed: " + r.stderr.decode(errors="replace").strip())
+    return r.stdout
+
+
+def aes_encrypt(key, iv, text: str) -> str:
+    return base64.b64encode(_openssl_aes(["-e"], key, iv, text.encode())).decode()
+
+
+def aes_decrypt(key, iv, b64: str) -> str:
+    return _openssl_aes(["-d"], key, iv, base64.b64decode(b64)).decode()
+
+
+# ---------- password ----------
+
+def get_password() -> str:
+    pw = os.environ.get("DECO_PASSWORD")
+    if pw:
+        return pw
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "service", "deco-monitor"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.rstrip("\n")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    path = os.path.expanduser("~/.config/deco-monitor/password")
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.read().rstrip("\n")
+    raise DecoError("no password: run  secret-tool store --label='Deco router' service deco-monitor")
+
+
+# ---------- session ----------
+
+class Deco:
+    def __init__(self):
+        self.jar = CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.stok = None
+        self.sysauth = None
+        self.load()
+
+    # session cache lives in $XDG_RUNTIME_DIR (tmpfs, per-user, cleared on logout)
+    def load(self):
+        try:
+            with open(CACHE) as f:
+                s = json.load(f)
+            if s.get("host") != HOST or time.time() - s.get("t", 0) > 3600:
+                return
+            self.stok, self.seq, self.hash = s["stok"], s["seq"], s["hash"]
+            self.key, self.iv = s["key"].encode(), s["iv"].encode()
+            self.sysauth = s.get("sysauth")
+        except (OSError, ValueError, KeyError):
+            self.stok = None
+
+    def save(self):
+        fd = os.open(CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"host": HOST, "t": time.time(), "stok": self.stok, "seq": self.seq,
+                       "hash": self.hash, "key": self.key.decode(), "iv": self.iv.decode(),
+                       "sysauth": self.sysauth}, f)
+
+    def http(self, url, body: bytes, extra_headers=None):
+        headers = {"Content-Type": "application/json", "User-Agent": "deco-monitor"}
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with self.opener.open(req, timeout=TIMEOUT) as r:
+                return r.read().decode()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise PermissionError(e.code)
+            raise DecoError(f"HTTP {e.code} from Deco")
+        except (urllib.error.URLError, OSError) as e:
+            raise DecoError(f"cannot reach Deco at {HOST}: {e}")
+
+    def plain(self, path, payload):
+        txt = self.http(BASE + "/" + path, json.dumps(payload).encode())
+        return json.loads(txt)
+
+    def sign(self, data_len, with_key):
+        if not hasattr(self, "sign_n"):  # not cached; refetch when reusing a session
+            auth = self.plain("login?form=auth", {"operation": "read"})["result"]
+            self.sign_n, self.sign_e = int(auth["key"][0], 16), int(auth["key"][1], 16)
+        s = self.seq + data_len
+        text = (f"k={self.key.decode()}&i={self.iv.decode()}&h={self.hash}&s={s}" if with_key
+                else f"h={self.hash}&s={s}")
+        return rsa_encrypt(self.sign_n, self.sign_e, text.encode())
+
+    def login(self):
+        pw = get_password()
+        keys = self.plain("login?form=keys", {"operation": "read"})["result"]["password"]
+        pn, pe = int(keys[0], 16), int(keys[1], 16)
+        auth = self.plain("login?form=auth", {"operation": "read"})["result"]
+        self.sign_n, self.sign_e = int(auth["key"][0], 16), int(auth["key"][1], 16)
+        self.seq = auth["seq"]
+        self.key = "".join(secrets.choice("0123456789") for _ in range(16)).encode()
+        self.iv = "".join(secrets.choice("0123456789") for _ in range(16)).encode()
+        self.hash = hashlib.md5(("admin" + pw).encode()).hexdigest()
+        payload = {"params": {"password": rsa_encrypt(pn, pe, pw.encode())}, "operation": "login"}
+        self.stok = ""
+        res = self._enc_post("login?form=login", payload, with_key=True)
+        if res.get("error_code") not in (0, None) or "stok" not in res.get("result", {}):
+            code = res.get("error_code")
+            attempts = res.get("result", {}).get("attemptsAllowed")
+            msg = f"login refused (error {code}): {json.dumps(res)[:300]}"
+            if attempts is not None:
+                msg += f", {attempts} attempts left"
+            raise DecoError(msg)
+        self.stok = res["result"]["stok"]
+        self.sysauth = next((c.value for c in self.jar if c.name == "sysauth"), None)
+        self.save()
+
+    def _enc_post(self, path, payload, with_key=False):
+        data = aes_encrypt(self.key, self.iv, json.dumps(payload, separators=(",", ":")))
+        body = urllib.parse.urlencode({"sign": self.sign(len(data), with_key), "data": data})
+        headers = {"Content-Type": "application/json"}
+        if self.sysauth and not with_key:
+            headers["Cookie"] = f"sysauth={self.sysauth}"
+        txt = self.http(BASE + self.stok + "/" + path, body.encode(), headers)
+        outer = json.loads(txt)
+        if "data" not in outer:
+            return outer
+        return json.loads(aes_decrypt(self.key, self.iv, outer["data"]))
+
+    def request(self, path, payload, _retry=True):
+        if not self.stok:
+            self.login()
+        try:
+            res = self._enc_post(path, payload)
+        except (PermissionError, DecoError, ValueError) as e:
+            if not _retry:
+                raise DecoError(str(e))
+            self.stok = None
+            return self.request(path, payload, _retry=False)
+        if res.get("error_code") not in (0, None):
+            if _retry and res.get("error_code") in (-40401, 401, -1):
+                self.stok = None
+                return self.request(path, payload, _retry=False)
+            raise DecoError(f"Deco error {res.get('error_code')} for {path}")
+        return res.get("result", {})
+
+
+# ---------- data shaping ----------
+
+def b64name(s):
+    try:
+        return base64.b64decode(s).decode("utf-8")
+    except Exception:
+        return s or ""
+
+
+BANDS = {"band2_4": "2.4 GHz", "band5": "5 GHz", "band6": "6 GHz", "wired": "Wired"}
+
+
+def clients(d):
+    res = d.request("admin/client?form=client_list",
+                    {"operation": "read", "params": {"device_mac": "default"}})
+    out = []
+    for c in res.get("client_list", []):
+        out.append({
+            "name": b64name(c.get("name", "")) or c.get("mac", "?"),
+            "mac": c.get("mac", ""),
+            "ip": c.get("ip", ""),
+            "online": bool(c.get("online", True)),
+            "connection": BANDS.get(c.get("connection_type", ""), c.get("connection_type", "")),
+            "network": c.get("interface", "main"),
+            "deco": c.get("access_host", ""),
+            "down_kbps": float(c.get("down_speed", 0) or 0),
+            "up_kbps": float(c.get("up_speed", 0) or 0),
+            "type": c.get("client_type", ""),
+        })
+    out.sort(key=lambda c: (-(c["down_kbps"] + c["up_kbps"]), c["name"].lower()))
+    return out
+
+
+def nodes(d):
+    res = d.request("admin/device?form=device_list", {"operation": "read"})
+    out = []
+    for n in res.get("device_list", []):
+        out.append({
+            "name": b64name(n.get("custom_nickname", "")) or b64name(n.get("nickname", "")) or n.get("device_model", "Deco"),
+            "mac": n.get("mac", ""),
+            "ip": n.get("device_ip", ""),
+            "model": n.get("device_model", ""),
+            "role": n.get("role", ""),
+            "online": n.get("group_status", "connected") == "connected",
+            "internet": n.get("inet_status", "") == "online",
+            "firmware": n.get("software_ver", ""),
+        })
+    return out
+
+
+def wan(d):
+    res = d.request("admin/network?form=wan_ipv4", {"operation": "read"})
+    w = res.get("wan", {}).get("ip_info", {})
+    return {"ip": w.get("ip", ""), "gateway": w.get("gateway", ""),
+            "dns1": w.get("dns1", ""), "dns2": w.get("dns2", ""),
+            "type": res.get("wan", {}).get("dial_type", "")}
+
+
+def perf(d):
+    try:
+        r = d.request("admin/network?form=performance", {"operation": "read"})
+        return {"cpu": round(float(r.get("cpu_usage", 0)) * 100), "mem": round(float(r.get("mem_usage", 0)) * 100)}
+    except (DecoError, ValueError, TypeError):
+        return {}
+
+
+STATE_DIR = os.path.expanduser("~/.local/state/deco-monitor")
+KNOWN = os.path.join(STATE_DIR, "known.json")
+OUT_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "deco-monitor")
+OUT = os.path.join(OUT_DIR, "status.json")
+
+
+def write_atomic(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def check_new(cl):
+    """Remember every MAC ever seen; notify for ones not seen before."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(KNOWN) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = None
+    first_run = known is None
+    known = known or {}
+    new = [c for c in cl if c["mac"] and c["mac"] not in known]
+    for c in new:
+        known[c["mac"]] = {"name": c["name"], "first_seen": 0 if first_run else int(time.time())}
+    if new or first_run:
+        write_atomic(KNOWN, known)
+    if not first_run:
+        for c in new:
+            subprocess.run(["notify-send", "-a", "Deco Monitor", "-i", "network-wireless",
+                            "New device on your network",
+                            f"{c['name']} ({c['ip']}, {c['connection']})"],
+                           capture_output=True, timeout=5)
+    return {m: v.get("first_seen", 0) for m, v in known.items()}
+
+
+def watch(interval):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    d = Deco()
+    status = {"ok": False, "error": "starting", "clients": [], "nodes": [], "wan": {}, "perf": {},
+              "history": [], "down_kbps": 0, "up_kbps": 0}
+    slow_every = max(1, round(30 / interval))  # nodes/wan/perf every ~30s
+    tick = 0
+    backoff = interval
+    while True:
+        try:
+            cl = clients(d)
+            seen = check_new(cl)
+            now = int(time.time())
+            for c in cl:
+                c["new"] = now - seen.get(c["mac"], 0) < 86400  # joined in last 24h
+            if tick % slow_every == 0 or not status["nodes"]:
+                status["nodes"] = nodes(d)
+                try:
+                    status["wan"] = wan(d)
+                except DecoError:
+                    pass
+                status["perf"] = perf(d)
+            down = sum(c["down_kbps"] for c in cl)
+            up = sum(c["up_kbps"] for c in cl)
+            status.update(ok=True, error="", time=now, clients=cl, down_kbps=down, up_kbps=up,
+                          interval=interval)
+            status["history"] = (status["history"] + [[down, up]])[-120:]
+            backoff = interval
+        except DecoError as e:
+            status.update(ok=False, error=str(e), time=int(time.time()))
+            d.stok = None
+            backoff = min(backoff * 2, 60)
+        except Exception as e:  # never die; report and retry
+            status.update(ok=False, error=f"{type(e).__name__}: {e}", time=int(time.time()))
+            backoff = min(backoff * 2, 60)
+        write_atomic(OUT, status)
+        tick += 1
+        time.sleep(backoff if not status["ok"] else interval)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    d = Deco()
+    if cmd == "clients":
+        r = clients(d)
+    elif cmd == "nodes":
+        r = nodes(d)
+    elif cmd == "wan":
+        r = wan(d)
+    elif cmd == "status":
+        cl = clients(d)
+        r = {"ok": True, "time": int(time.time()), "clients": cl, "nodes": nodes(d), "perf": perf(d),
+             "down_kbps": sum(c["down_kbps"] for c in cl), "up_kbps": sum(c["up_kbps"] for c in cl)}
+        try:
+            r["wan"] = wan(d)
+        except DecoError:
+            r["wan"] = {}
+    elif cmd == "watch":
+        watch(max(2.0, float(argv[2]) if len(argv) > 2 else 3.0))
+        return 0
+    elif cmd == "reboot":
+        macs = argv[2:] or [n["mac"] for n in nodes(d)]
+        r = d.request("admin/device?form=system",
+                      {"operation": "reboot", "params": {"mac_list": [{"mac": m} for m in macs]}})
+    elif cmd == "raw" and len(argv) == 4:
+        r = d.request(argv[2], json.loads(argv[3]))
+    elif cmd == "logout":
+        try:
+            os.unlink(CACHE)
+        except OSError:
+            pass
+        r = {"ok": True}
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    print(json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except DecoError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
