@@ -261,14 +261,30 @@ ApplicationWindow {
                     foreground: win.fg
                 }
                 Label {
+                    id: peakLabel
+                    z: 2
                     anchors.top: parent.top; anchors.right: parent.right; anchors.margins: 10
                     text: qsTr("peak %1 · last %2 min").arg(win.speed(graph.peak / 1.15))
                                                          .arg(Math.max(1, Math.round(120 * backend.interval / 60)))
                     color: win.muted
                     font.pixelSize: 11
                 }
+                // Legend and peak sit on small solid plates so the graph line
+                // running underneath doesn't make them hard to read.
+                Rectangle {
+                    anchors.fill: legend; anchors.margins: -5
+                    radius: win.smallRadius
+                    color: Qt.rgba(win.surface.r, win.surface.g, win.surface.b, 0.85)
+                }
+                Rectangle {
+                    anchors.fill: peakLabel; anchors.margins: -5
+                    radius: win.smallRadius
+                    color: Qt.rgba(win.surface.r, win.surface.g, win.surface.b, 0.85)
+                    z: 1
+                }
                 Row {
-                    anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.margins: 10
+                    id: legend
+                    anchors.top: parent.top; anchors.left: parent.left; anchors.margins: 10
                     spacing: 14
                     Row {
                         spacing: 6
