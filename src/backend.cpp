@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkInterface>
 #include <QStandardPaths>
 
 namespace {
@@ -43,6 +44,30 @@ Backend::Backend(const QString &statusPath, const QString &decoCommand, QObject 
         m_rebootMessage = tr("Could not run deco: %1").arg(m_reboot.errorString());
         emit rebootingChanged();
     });
+    connect(&m_block, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        const QJsonObject result = QJsonDocument::fromJson(m_block.readAllStandardOutput()).object();
+        const bool ok = status == QProcess::NormalExit && code == 0;
+        if (ok)
+            m_blockMessage = m_blockVerb == "block" ? tr("%1 is blocked.").arg(m_blockName)
+                                                    : tr("%1 is unblocked.").arg(m_blockName);
+        else
+            m_blockMessage = tr("Couldn't %1 %2: %3")
+                                 .arg(m_blockVerb == "block" ? tr("block") : tr("unblock"), m_blockName,
+                                      result.value("error").toString(tr("unknown error")));
+        emit blockingChanged();
+        reload();
+    });
+    connect(&m_block, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        if (m_block.state() != QProcess::NotRunning) return;
+        m_blockMessage = tr("Could not run deco: %1").arg(m_block.errorString());
+        emit blockingChanged();
+    });
+
+    // This computer's own MACs: the app hides Block for them, so a click
+    // can't cut off the machine it's running on.
+    for (const QNetworkInterface &i : QNetworkInterface::allInterfaces())
+        if (!i.hardwareAddress().isEmpty())
+            m_ownMacs << i.hardwareAddress().toUpper().replace(':', '-');
     reload();
 }
 
@@ -83,6 +108,20 @@ void Backend::applyStatus(const QByteArray &json, qint64 now) {
     // file means the service itself has stopped.
     const bool stale = m_updated > 0 && now - m_updated > qMax<qint64>(30, qint64(m_interval * 6));
     m_state = stale ? Stale : ok ? Ok : Failing;
+
+    m_blockedError = clip(d.value("blocked_error"), 300);
+    // "blocked_time" is set once the service has really read the list.
+    if (d.contains("blocked") && d.value("blocked_time").toDouble() > 0) {
+        m_blockedKnown = true;
+        m_blocked.clear();
+        const QJsonArray bl = d.value("blocked").toArray();
+        for (int i = 0; i < bl.size() && i < 256; ++i) {
+            const QJsonObject b = bl.at(i).toObject();
+            m_blocked.append(QVariantMap{{"name", clip(b.value("name"), 64)},
+                                         {"mac", clip(b.value("mac"), 20)},
+                                         {"type", clip(b.value("type"), 24)}});
+        }
+    }
 
     if (ok) {
         m_down = positive(d.value("down_kbps"));
@@ -162,3 +201,21 @@ void Backend::startService() {
     QProcess::startDetached("systemctl", {"--user", "enable", "--now", "deco-monitor.service"});
     QTimer::singleShot(4000, this, &Backend::reload);
 }
+
+void Backend::runBlock(const QString &verb, const QString &mac, const QString &name) {
+    if (blocking())
+        return;
+    if (m_deco.isEmpty()) {
+        m_blockMessage = tr("The deco command is not installed.");
+        emit blockingChanged();
+        return;
+    }
+    m_blockVerb = verb;
+    m_blockName = name.left(64);
+    m_blockMessage.clear();
+    m_block.start(m_deco, {verb, mac.left(20)});
+    emit blockingChanged();
+}
+
+void Backend::block(const QString &mac, const QString &name) { runBlock("block", mac, name); }
+void Backend::unblock(const QString &mac, const QString &name) { runBlock("unblock", mac, name); }

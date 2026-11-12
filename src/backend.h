@@ -27,6 +27,12 @@ class Backend : public QObject {
     Q_PROPERTY(double interval READ interval NOTIFY changed)
     Q_PROPERTY(bool rebooting READ rebooting NOTIFY rebootingChanged)
     Q_PROPERTY(QString rebootMessage READ rebootMessage NOTIFY rebootingChanged)
+    Q_PROPERTY(QVariantList blocked READ blocked NOTIFY changed)
+    Q_PROPERTY(QString blockedError READ blockedError NOTIFY changed)
+    Q_PROPERTY(bool blockedKnown READ blockedKnown NOTIFY changed)
+    Q_PROPERTY(bool blocking READ blocking NOTIFY blockingChanged)
+    Q_PROPERTY(QString blockMessage READ blockMessage NOTIFY blockingChanged)
+    Q_PROPERTY(QStringList ownMacs READ ownMacs CONSTANT)
 
 public:
     enum State { NoService, Ok, Failing, Stale };
@@ -48,6 +54,12 @@ public:
     double interval() const { return m_interval; }
     bool rebooting() const { return m_reboot.state() != QProcess::NotRunning; }
     QString rebootMessage() const { return m_rebootMessage; }
+    QVariantList blocked() const { return m_blocked; }
+    QString blockedError() const { return m_blockedError; }
+    bool blockedKnown() const { return m_blockedKnown; }
+    bool blocking() const { return m_block.state() != QProcess::NotRunning; }
+    QString blockMessage() const { return m_blockMessage; }
+    QStringList ownMacs() const { return m_ownMacs; }
 
     // Parses one status document; public so tests can feed it directly.
     void applyStatus(const QByteArray &json, qint64 nowSeconds);
@@ -55,10 +67,15 @@ public:
     Q_INVOKABLE void reload();
     Q_INVOKABLE void reboot(const QStringList &macs);
     Q_INVOKABLE void startService();
+    // Puts a device on (or takes it off) the Deco's blocked list, the same
+    // list the phone app's Block button uses.
+    Q_INVOKABLE void block(const QString &mac, const QString &name);
+    Q_INVOKABLE void unblock(const QString &mac, const QString &name);
 
 signals:
     void changed();
     void rebootingChanged();
+    void blockingChanged();
 
 private:
     void watch();
@@ -68,6 +85,8 @@ private:
     QFileSystemWatcher m_watcher;
     QTimer m_poll;
     QProcess m_reboot;
+    QProcess m_block;
+    void runBlock(const QString &verb, const QString &mac, const QString &name);
 
     State m_state = NoService;
     QString m_error;
@@ -77,4 +96,10 @@ private:
     int m_cpu = -1, m_mem = -1;
     qint64 m_updated = 0;
     QString m_rebootMessage;
+    QVariantList m_blocked;
+    QString m_blockedError;
+    bool m_blockedKnown = false;
+    QString m_blockMessage;
+    QString m_blockVerb, m_blockName;
+    QStringList m_ownMacs;
 };

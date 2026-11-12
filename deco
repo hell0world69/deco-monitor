@@ -12,6 +12,9 @@ Usage:
   deco raw PATH JSON    send an arbitrary request, e.g.
                         deco raw 'admin/device?form=device_list' '{"operation":"read"}'
   deco logout           drop the cached session
+  deco blocked          devices on the Deco's blocked list (JSON)
+  deco block MAC        block a device from the network (like the app's Block button)
+  deco unblock MAC      take a device off the blocked list
   deco tmp OPCODE [JSON --write] [--force]
                         talk the phone app's local protocol (SSH port 20001);
                         needs the TP-Link ID email in the keyring (service deco-monitor-email)
@@ -382,6 +385,84 @@ class Tmp:
         return doc.get("result", doc)
 
 
+
+# Opcodes and parameters from the Deco app (com.tplink.tpm5 3.10.666):
+# TMP_APPV2_OP_CLIENT_LIST_BLOCK 0x4017 takes ClientBlockParams
+#   {"client_list": [{"mac", "name" (base64), "client_type"}]};
+# TMP_APPV2_OP_BLOCKED_LIST_GET 0x4018;
+# TMP_APPV2_OP_BLOCKED_LIST_UNBLOCK 0x4019 takes ClientUnblockParams
+#   {"client_list": ["<mac>"]}.
+OP_CLIENTS, OP_BLOCK, OP_BLOCKED, OP_UNBLOCK = 0x4012, 0x4017, 0x4018, 0x4019
+
+
+def norm_mac(mac):
+    m = mac.strip().upper().replace(":", "-")
+    if len(m) != 17 or any(c not in "0123456789ABCDEF-" for c in m):
+        raise DecoError(f"not a MAC address: {mac!r}")
+    return m
+
+
+def blocked_list(t):
+    out = []
+    for c in (t.call(OP_BLOCKED) or {}).get("client_list", []):
+        out.append({"mac": c.get("mac", ""), "name": b64name(c.get("name", "")) or c.get("mac", ""),
+                    "type": c.get("client_type", "")})
+    return out
+
+
+def own_macs():
+    """MACs of this computer, so it can't block itself by mistake."""
+    macs = set()
+    for dev in os.listdir("/sys/class/net"):
+        try:
+            with open(f"/sys/class/net/{dev}/address") as f:
+                macs.add(f.read().strip().upper().replace(":", "-"))
+        except OSError:
+            pass
+    return macs
+
+
+def block(t, mac, allow_self=False):
+    mac = norm_mac(mac)
+    if mac in own_macs() and not allow_self:
+        raise DecoError("refusing to block this computer (use --force to really do it)")
+    known = next((c for c in (t.call(OP_CLIENTS) or {}).get("client_list", []) if c.get("mac") == mac), None)
+    if known is None:
+        raise DecoError(f"{mac} is not in the Deco's client list")
+    t.call(OP_BLOCK, {"client_list": [{"mac": mac, "name": known.get("name", ""),
+                                       "client_type": known.get("client_type", "other")}]})
+    after = blocked_list(t)
+    if not any(c["mac"] == mac for c in after):
+        raise DecoError("the Deco accepted the request but the device is not in the blocked list")
+    return after
+
+
+def unblock(t, mac):
+    mac = norm_mac(mac)
+    t.call(OP_UNBLOCK, {"client_list": [mac]})
+    after = blocked_list(t)
+    if any(c["mac"] == mac for c in after):
+        raise DecoError("the Deco accepted the request but the device is still blocked")
+    return after
+
+
+def patch_status_blocked(blocked):
+    """Update the service's status file right away, so the app and widget
+    show the change without waiting for the next blocked-list poll."""
+    try:
+        with open(OUT_PATH()) as f:
+            st = json.load(f)
+        st["blocked"] = blocked
+        st["blocked_time"] = int(time.time())
+        write_atomic(OUT_PATH(), st)
+    except (OSError, ValueError):
+        pass
+
+
+def OUT_PATH():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "deco-monitor", "status.json")
+
+
 # ---------- data shaping ----------
 
 def b64name(s):
@@ -491,6 +572,9 @@ def watch(interval):
     status = {"ok": False, "error": "starting", "clients": [], "nodes": [], "wan": {}, "perf": {},
               "history": [], "down_kbps": 0, "up_kbps": 0}
     slow_every = max(1, round(30 / interval))  # nodes/wan/perf every ~30s
+    blocked_every = max(1, round(60 / interval))  # blocked list (TMP over SSH) every ~60s
+    status["blocked"] = []
+    status["blocked_error"] = ""
     tick = 0
     backoff = interval
     while True:
@@ -507,6 +591,17 @@ def watch(interval):
                 except DecoError:
                     pass
                 status["perf"] = perf(d)
+            if tick % blocked_every == 0:
+                try:
+                    t = Tmp()
+                    try:
+                        status["blocked"] = blocked_list(t)
+                        status["blocked_time"] = int(time.time())
+                        status["blocked_error"] = ""
+                    finally:
+                        t.close()
+                except DecoError as e:
+                    status["blocked_error"] = str(e)[:300]
             down = sum(c["down_kbps"] for c in cl)
             up = sum(c["up_kbps"] for c in cl)
             status.update(ok=True, error="", time=now, clients=cl, down_kbps=down, up_kbps=up,
@@ -520,6 +615,16 @@ def watch(interval):
         except Exception as e:  # never die; report and retry
             status.update(ok=False, error=f"{type(e).__name__}: {e}", time=int(time.time()))
             backoff = min(backoff * 2, 60)
+        # A `deco block`/`unblock` run patches the file directly; keep its
+        # newer blocked list instead of overwriting it with ours.
+        try:
+            with open(OUT) as f:
+                on_disk = json.load(f)
+            if on_disk.get("blocked_time", 0) > status.get("blocked_time", 0):
+                status["blocked"] = on_disk.get("blocked", [])
+                status["blocked_time"] = on_disk["blocked_time"]
+        except (OSError, ValueError):
+            pass
         write_atomic(OUT, status)
         tick += 1
         time.sleep(backoff if not status["ok"] else interval)
@@ -549,6 +654,21 @@ def main(argv):
         macs = argv[2:] or [n["mac"] for n in nodes(d)]
         r = d.request("admin/device?form=system",
                       {"operation": "reboot", "params": {"mac_list": [{"mac": m} for m in macs]}})
+    elif cmd in ("block", "unblock") and len(argv) >= 3:
+        mac = [a for a in argv[2:] if not a.startswith("--")][0]
+        t = Tmp()
+        try:
+            blk = block(t, mac, allow_self="--force" in argv) if cmd == "block" else unblock(t, mac)
+        finally:
+            t.close()
+        patch_status_blocked(blk)
+        r = {"ok": True, "blocked": blk}
+    elif cmd == "blocked":
+        t = Tmp()
+        try:
+            r = blocked_list(t)
+        finally:
+            t.close()
     elif cmd == "tmp" and len(argv) >= 3:
         # deco tmp OPCODE            read (e.g. 0x4018)
         # deco tmp OPCODE JSON --write   write params (changes the Deco)

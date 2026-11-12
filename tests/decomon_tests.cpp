@@ -88,6 +88,28 @@ private slots:
         QVERIFY(backend.rebootMessage().startsWith("Reboot failed"));
     }
 
+    void parsesBlockedList()
+    {
+        QTemporaryDir dir;
+        Backend backend(dir.filePath("status.json"), "/bin/false");
+        backend.applyStatus(R"({"ok":true,"time":1,"blocked_time":1,"blocked":[{"mac":"02-00-00-00-00-01","name":"Laptop","type":"pc"}]})", 1);
+        QVERIFY(backend.blockedKnown());
+        QCOMPARE(backend.blocked().size(), 1);
+        QCOMPARE(backend.blocked().first().toMap().value("name").toString(), QString("Laptop"));
+        // A status written before the first blocked-list poll keeps the last list.
+        backend.applyStatus(R"({"ok":true,"time":2})", 2);
+        QCOMPARE(backend.blocked().size(), 1);
+    }
+
+    void blockReportsFailure()
+    {
+        QTemporaryDir dir;
+        Backend backend(dir.filePath("status.json"), "/bin/false");
+        backend.block("AA-BB-CC-DD-EE-FF", "Phone");
+        QTRY_VERIFY(!backend.blocking());
+        QVERIFY(backend.blockMessage().startsWith("Couldn't block Phone"));
+    }
+
     void themeFallsBack()
     {
         QTemporaryDir dir;

@@ -26,11 +26,20 @@ ApplicationWindow {
     readonly property color danger: "#ff6b6b"
     readonly property int radius: theme.radius
     readonly property int smallRadius: Math.min(4, theme.radius)
+    // In a narrow tile the IP and connection columns give way to names.
+    readonly property bool wide: width >= 1000
 
     property bool helpVisible: false
     property bool showIdle: true
     property bool sortByName: false
     property var pendingReboot: null      // {macs: [...], label: "..."}
+    property var pendingBlock: null       // {mac, name, unblock: bool}
+
+    function isOwn(mac) { return backend.ownMacs.indexOf(mac) >= 0 }
+    function askBlock(c) {
+        if (!c || win.isOwn(c.mac) || backend.blocking) return
+        win.pendingBlock = { mac: c.mac, name: c.name, unblock: false }
+    }
 
     // ------------------------------------------------------------ formatting
     function speed(kbps) {
@@ -65,6 +74,11 @@ ApplicationWindow {
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.showIdle = !win.showIdle }
     Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.sortByName = !win.sortByName }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; onActivated: search.forceActiveFocus() }
+    Shortcut {
+        sequence: "B"; context: Qt.ApplicationShortcut
+        enabled: !search.activeFocus && list.currentIndex >= 0 && !backend.blocking
+        onActivated: win.askBlock(win.visibleClients[list.currentIndex])
+    }
     Shortcut { sequences: ["Ctrl+F"]; context: Qt.ApplicationShortcut; onActivated: search.forceActiveFocus() }
     Shortcut {
         sequence: "R"; context: Qt.ApplicationShortcut
@@ -74,7 +88,8 @@ ApplicationWindow {
     Shortcut {
         sequence: "Esc"; context: Qt.ApplicationShortcut
         onActivated: {
-            if (win.pendingReboot) win.pendingReboot = null
+            if (win.pendingBlock) win.pendingBlock = null
+            else if (win.pendingReboot) win.pendingReboot = null
             else if (win.helpVisible) win.helpVisible = false
             else if (search.text !== "" || search.activeFocus) { search.text = ""; list.forceActiveFocus() }
         }
@@ -305,10 +320,11 @@ ApplicationWindow {
                             Layout.leftMargin: 10; Layout.rightMargin: 10
                             spacing: 12
                             Label { text: qsTr("Name"); color: win.muted; font.pixelSize: 11; Layout.fillWidth: true }
-                            Label { text: qsTr("IP address"); color: win.muted; font.pixelSize: 11; Layout.preferredWidth: 120 }
-                            Label { text: qsTr("Connection"); color: win.muted; font.pixelSize: 11; Layout.preferredWidth: 80 }
+                            Label { text: qsTr("IP address"); color: win.muted; font.pixelSize: 11; Layout.preferredWidth: 120; visible: win.wide }
+                            Label { text: qsTr("Connection"); color: win.muted; font.pixelSize: 11; Layout.preferredWidth: 80; visible: win.wide }
                             Label { text: qsTr("Down"); color: win.muted; font.pixelSize: 11; Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight }
                             Label { text: qsTr("Up"); color: win.muted; font.pixelSize: 11; Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight }
+                            Item { Layout.preferredWidth: 30 }
                         }
 
                         ListView {
@@ -362,7 +378,8 @@ ApplicationWindow {
                                                 Layout.fillWidth: true
                                                 textFormat: Text.PlainText
                                                 visible: text !== ""
-                                                text: [row.modelData.type, row.modelData.network === "guest" ? qsTr("Guest network") : ""].filter(s => s).join(" · ")
+                                                text: [row.modelData.type, win.wide ? "" : row.modelData.ip, win.wide ? "" : row.modelData.connection,
+                                                       row.modelData.network === "guest" ? qsTr("Guest network") : ""].filter(s => s).join(" · ")
                                                 color: win.muted
                                                 font.pixelSize: 11
                                                 elide: Text.ElideRight
@@ -385,6 +402,7 @@ ApplicationWindow {
                                     }
                                     Label {
                                         Layout.preferredWidth: 120
+                                        visible: win.wide
                                         textFormat: Text.PlainText
                                         text: row.modelData.ip
                                         color: win.muted
@@ -392,6 +410,7 @@ ApplicationWindow {
                                     }
                                     Label {
                                         Layout.preferredWidth: 80
+                                        visible: win.wide
                                         textFormat: Text.PlainText
                                         text: row.modelData.connection
                                         color: win.muted
@@ -410,6 +429,20 @@ ApplicationWindow {
                                         text: win.speed(row.modelData.up)
                                         color: row.busy ? win.fg : win.muted
                                         font.features: { "tnum": 1 }
+                                    }
+                                    ToolButton {
+                                        Layout.preferredWidth: 30
+                                        implicitHeight: 30
+                                        topInset: 0; bottomInset: 0
+                                        text: "⊘"
+                                        font.pixelSize: 16
+                                        // Shown on hover or selection; never for this computer.
+                                        opacity: (hover.hovered || (row.ListView.isCurrentItem && list.activeFocus)) && !win.isOwn(row.modelData.mac) ? 1 : 0
+                                        enabled: opacity > 0 && !backend.blocking
+                                        Material.foreground: win.danger
+                                        ToolTip.visible: hovered && enabled
+                                        ToolTip.text: qsTr("Block %1  (B)").arg(row.modelData.name)
+                                        onClicked: win.askBlock(row.modelData)
                                     }
                                 }
                             }
@@ -513,9 +546,70 @@ ApplicationWindow {
                             }
                         }
 
+                        Label {
+                            Layout.topMargin: 8
+                            text: qsTr("Blocked devices")
+                            color: win.fg; font.bold: true; font.pixelSize: 16
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            visible: backend.blocked.length === 0
+                            wrapMode: Text.Wrap
+                            text: backend.blockedError !== "" ? backend.blockedError
+                                : backend.blockedKnown ? qsTr("No blocked devices")
+                                : qsTr("Reading the blocked list…")
+                            color: win.muted; font.pixelSize: 12
+                        }
+                        Repeater {
+                            model: backend.blocked
+                            delegate: Rectangle {
+                                id: blockedRow
+                                required property var modelData
+                                Layout.fillWidth: true
+                                implicitHeight: 44
+                                radius: win.smallRadius
+                                color: Qt.rgba(win.danger.r, win.danger.g, win.danger.b, 0.06)
+                                border.color: Qt.rgba(win.danger.r, win.danger.g, win.danger.b, 0.25)
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 12; anchors.rightMargin: 6
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 0
+                                        Label {
+                                            Layout.fillWidth: true
+                                            textFormat: Text.PlainText
+                                            text: blockedRow.modelData.name
+                                            color: win.fg
+                                            elide: Text.ElideRight
+                                        }
+                                        Label {
+                                            textFormat: Text.PlainText
+                                            text: blockedRow.modelData.mac
+                                            color: win.muted; font.pixelSize: 11
+                                        }
+                                    }
+                                    Button {
+                                        flat: true
+                                        text: qsTr("Unblock")
+                                        enabled: !backend.blocking
+                                        onClicked: win.pendingBlock = { mac: blockedRow.modelData.mac, name: blockedRow.modelData.name, unblock: true }
+                                    }
+                                }
+                            }
+                        }
                         }
                         }
 
+                        Label {
+                            Layout.fillWidth: true
+                            textFormat: Text.PlainText
+                            visible: backend.blockMessage !== "" || backend.blocking
+                            text: backend.blocking ? qsTr("Talking to the Deco…") : backend.blockMessage
+                            wrapMode: Text.Wrap
+                            color: win.muted
+                            font.pixelSize: 12
+                        }
                         Label {
                             Layout.fillWidth: true
                             textFormat: Text.PlainText
@@ -534,7 +628,7 @@ ApplicationWindow {
                         Label {
                             Layout.fillWidth: true
                             wrapMode: Text.Wrap
-                            text: qsTr("Blocking and parental controls are only in the Deco phone app.")
+                            text: qsTr("Parental controls and QoS are only in the Deco phone app.")
                             color: Qt.darker(win.muted, 1.3)
                             font.pixelSize: 11
                         }
@@ -596,6 +690,69 @@ ApplicationWindow {
             }
         }
 
+        // -------------------------------------------------------- block confirm
+        Rectangle {
+            anchors.fill: parent
+            visible: win.pendingBlock !== null
+            color: Qt.rgba(0, 0, 0, 0.6)
+            MouseArea { anchors.fill: parent; onClicked: win.pendingBlock = null }
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 40, 420)
+                implicitHeight: blockCol.implicitHeight + 40
+                radius: win.radius
+                color: win.surface
+                border.color: win.pendingBlock && !win.pendingBlock.unblock ? win.danger : theme.accent
+
+                ColumnLayout {
+                    id: blockCol
+                    anchors.fill: parent
+                    anchors.margins: 20
+                    spacing: 12
+                    Label {
+                        Layout.fillWidth: true
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        text: !win.pendingBlock ? ""
+                              : win.pendingBlock.unblock ? qsTr("Unblock %1?").arg(win.pendingBlock.name)
+                              : qsTr("Block %1?").arg(win.pendingBlock.name)
+                        color: win.fg; font.bold: true; font.pixelSize: 17
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: win.pendingBlock && win.pendingBlock.unblock
+                              ? qsTr("It can join the network again.")
+                              : qsTr("It's disconnected and can't rejoin until you unblock it here or in the Deco app.")
+                        color: win.muted
+                    }
+                    RowLayout {
+                        Layout.alignment: Qt.AlignRight
+                        Button { text: qsTr("Cancel  (Esc)"); flat: true; onClicked: win.pendingBlock = null }
+                        Button {
+                            id: blockConfirm
+                            text: win.pendingBlock && win.pendingBlock.unblock ? qsTr("Unblock  (Enter)") : qsTr("Block  (Enter)")
+                            highlighted: true
+                            Material.accent: win.pendingBlock && !win.pendingBlock.unblock ? win.danger : theme.accent
+                            onClicked: {
+                                const b = win.pendingBlock
+                                win.pendingBlock = null
+                                if (b.unblock) backend.unblock(b.mac, b.name)
+                                else backend.block(b.mac, b.name)
+                            }
+                        }
+                    }
+                }
+            }
+            Shortcut {
+                sequences: ["Return", "Enter"]
+                enabled: win.pendingBlock !== null
+                context: Qt.ApplicationShortcut
+                onActivated: blockConfirm.clicked()
+            }
+        }
+
         // --------------------------------------------------------------- help
         Rectangle {
             anchors.fill: parent
@@ -623,6 +780,7 @@ ApplicationWindow {
                             ["Space", qsTr("Show or hide idle devices")],
                             ["S", qsTr("Sort by speed or name")],
                             ["↑ ↓", qsTr("Move through devices")],
+                            ["B", qsTr("Block the selected device")],
                             ["R", qsTr("Reboot all Deco units")],
                             ["Esc", qsTr("Clear search, close dialogs")],
                             ["?", qsTr("Show this help")],
