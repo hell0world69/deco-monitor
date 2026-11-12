@@ -31,7 +31,16 @@ ApplicationWindow {
 
     property bool helpVisible: false
     property bool showIdle: true
-    property bool sortByName: false
+    // "connection" keeps the list steady: grouped Wired, 6 GHz, 5 GHz,
+    // 2.4 GHz, then anything else, and alphabetical inside each group, so rows
+    // don't jump around as speeds change. S cycles to name and speed.
+    property string sortMode: "connection"
+    readonly property var connectionOrder: ["Wired", "6 GHz", "5 GHz", "2.4 GHz"]
+    function connectionRank(c) {
+        const i = win.connectionOrder.indexOf(c)
+        return i < 0 ? win.connectionOrder.length : i
+    }
+    function byName(a, b) { return a.name.localeCompare(b.name) || a.mac.localeCompare(b.mac) }
     property var pendingReboot: null      // {macs: [...], label: "..."}
     property var pendingBlock: null       // {mac, name, unblock: bool}
 
@@ -74,7 +83,11 @@ ApplicationWindow {
             if (!q) return true
             return (c.name + " " + c.ip + " " + c.mac + " " + c.connection + " " + c.type).toLowerCase().indexOf(q) >= 0
         })
-        if (win.sortByName) list = list.slice().sort((a, b) => a.name.localeCompare(b.name))
+        if (win.sortMode === "connection")
+            list = list.slice().sort((a, b) => win.connectionRank(a.connection) - win.connectionRank(b.connection) || win.byName(a, b))
+        else if (win.sortMode === "name")
+            list = list.slice().sort(win.byName)
+        // "speed" keeps the service's order, busiest first.
         return list
     }
 
@@ -84,7 +97,7 @@ ApplicationWindow {
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; onActivated: win.helpVisible = !win.helpVisible }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: Qt.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.showIdle = !win.showIdle }
-    Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.sortByName = !win.sortByName }
+    Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.sortMode = win.sortMode === "connection" ? "name" : win.sortMode === "name" ? "speed" : "connection" }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; onActivated: search.forceActiveFocus() }
     Shortcut {
         sequences: ["Menu", "Shift+F10"]; context: Qt.ApplicationShortcut
@@ -296,7 +309,7 @@ ApplicationWindow {
                                 color: win.fg; font.bold: true; font.pixelSize: 16
                             }
                             Label {
-                                text: (win.showIdle ? "" : qsTr("active only") + " · ") + (win.sortByName ? qsTr("by name") : qsTr("by speed"))
+                                text: (win.showIdle ? "" : qsTr("active only") + " · ") + (win.sortMode === "connection" ? qsTr("by connection") : win.sortMode === "name" ? qsTr("by name") : qsTr("by speed"))
                                 color: win.muted; font.pixelSize: 12
                                 Layout.leftMargin: 8
                             }
@@ -833,7 +846,7 @@ ApplicationWindow {
                         model: [
                             ["/", qsTr("Search devices")],
                             ["Space", qsTr("Show or hide idle devices")],
-                            ["S", qsTr("Sort by speed or name")],
+                            ["S", qsTr("Sort by connection, name or speed")],
                             ["↑ ↓", qsTr("Move through devices")],
                             ["B", qsTr("Block the selected device")],
                             ["Menu", qsTr("Device menu (also right-click)")],

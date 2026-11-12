@@ -58,7 +58,7 @@ Speeds from the Deco are kilobits per second.
 |---|---|
 | `/` or `Ctrl+F` | Search devices |
 | `Space` | Show or hide idle devices |
-| `S` | Sort by speed or name |
+| `S` | Sort by connection (Wired, 6 GHz, 5 GHz, 2.4 GHz; the default), name, or speed |
 | `↑` `↓` | Move through devices |
 | `B` | Block the selected device (asks first) |
 | `Menu` or `Shift+F10` | Device menu: Block, Unblock, copy IP or MAC (also right-click) |
