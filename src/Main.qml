@@ -36,9 +36,21 @@ ApplicationWindow {
     property var pendingBlock: null       // {mac, name, unblock: bool}
 
     function isOwn(mac) { return backend.ownMacs.indexOf(mac) >= 0 }
+    function isBlocked(mac) { return backend.blocked.some(b => b.mac === mac) }
     function askBlock(c) {
-        if (!c || win.isOwn(c.mac) || backend.blocking) return
+        if (!c || win.isOwn(c.mac) || win.isBlocked(c.mac) || backend.blocking) return
         win.pendingBlock = { mac: c.mac, name: c.name, unblock: false }
+    }
+    function askUnblock(c) {
+        if (!c || !win.isBlocked(c.mac) || backend.blocking) return
+        win.pendingBlock = { mac: c.mac, name: c.name, unblock: true }
+    }
+    // Opens the right-click menu for a device; with no position it pops up at
+    // the pointer, which is where the user just clicked.
+    function openMenu(c, item) {
+        deviceMenu.target = c
+        if (item) deviceMenu.popup(item, item.width / 2, item.height / 2)
+        else deviceMenu.popup()
     }
 
     // ------------------------------------------------------------ formatting
@@ -74,6 +86,11 @@ ApplicationWindow {
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.showIdle = !win.showIdle }
     Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.sortByName = !win.sortByName }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; onActivated: search.forceActiveFocus() }
+    Shortcut {
+        sequences: ["Menu", "Shift+F10"]; context: Qt.ApplicationShortcut
+        enabled: !search.activeFocus && list.currentIndex >= 0 && list.currentItem !== null
+        onActivated: win.openMenu(win.visibleClients[list.currentIndex], list.currentItem)
+    }
     Shortcut {
         sequence: "B"; context: Qt.ApplicationShortcut
         enabled: !search.activeFocus && list.currentIndex >= 0 && !backend.blocking
@@ -351,6 +368,10 @@ ApplicationWindow {
                                 readonly property bool busy: modelData.down + modelData.up >= 1000
                                 HoverHandler { id: hover }
                                 TapHandler { onTapped: list.currentIndex = row.index }
+                                TapHandler {
+                                    acceptedButtons: Qt.RightButton
+                                    onTapped: { list.currentIndex = row.index; win.openMenu(row.modelData) }
+                                }
 
                                 RowLayout {
                                     anchors.fill: parent
@@ -570,6 +591,10 @@ ApplicationWindow {
                                 radius: win.smallRadius
                                 color: Qt.rgba(win.danger.r, win.danger.g, win.danger.b, 0.06)
                                 border.color: Qt.rgba(win.danger.r, win.danger.g, win.danger.b, 0.25)
+                                TapHandler {
+                                    acceptedButtons: Qt.RightButton
+                                    onTapped: win.openMenu(blockedRow.modelData)
+                                }
                                 RowLayout {
                                     anchors.fill: parent
                                     anchors.leftMargin: 12; anchors.rightMargin: 6
@@ -753,6 +778,36 @@ ApplicationWindow {
             }
         }
 
+        // ---------------------------------------------------- right-click menu
+        Menu {
+            id: deviceMenu
+            property var target: null
+            readonly property bool own: target ? win.isOwn(target.mac) : false
+            readonly property bool blockedNow: target ? win.isBlocked(target.mac) : false
+
+            MenuItem {
+                text: qsTr("Block")
+                enabled: deviceMenu.target !== null && !deviceMenu.own && !deviceMenu.blockedNow && !backend.blocking
+                onTriggered: win.askBlock(deviceMenu.target)
+            }
+            MenuItem {
+                text: qsTr("Unblock")
+                enabled: deviceMenu.blockedNow && !backend.blocking
+                onTriggered: win.askUnblock(deviceMenu.target)
+            }
+            MenuSeparator {}
+            MenuItem {
+                text: qsTr("Copy IP address")
+                enabled: deviceMenu.target !== null && (deviceMenu.target.ip || "") !== ""
+                onTriggered: backend.copy(deviceMenu.target.ip)
+            }
+            MenuItem {
+                text: qsTr("Copy MAC address")
+                enabled: deviceMenu.target !== null
+                onTriggered: backend.copy(deviceMenu.target.mac)
+            }
+        }
+
         // --------------------------------------------------------------- help
         Rectangle {
             anchors.fill: parent
@@ -781,6 +836,7 @@ ApplicationWindow {
                             ["S", qsTr("Sort by speed or name")],
                             ["↑ ↓", qsTr("Move through devices")],
                             ["B", qsTr("Block the selected device")],
+                            ["Menu", qsTr("Device menu (also right-click)")],
                             ["R", qsTr("Reboot all Deco units")],
                             ["Esc", qsTr("Clear search, close dialogs")],
                             ["?", qsTr("Show this help")],

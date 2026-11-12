@@ -1,6 +1,8 @@
 #include "backend.h"
 
+#include <QClipboard>
 #include <QDateTime>
+#include <QGuiApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -219,3 +221,8 @@ void Backend::runBlock(const QString &verb, const QString &mac, const QString &n
 
 void Backend::block(const QString &mac, const QString &name) { runBlock("block", mac, name); }
 void Backend::unblock(const QString &mac, const QString &name) { runBlock("unblock", mac, name); }
+
+void Backend::copy(const QString &text) {
+    if (auto *clipboard = QGuiApplication::clipboard())
+        clipboard->setText(text.left(64));
+}

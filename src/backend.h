@@ -71,6 +71,7 @@ public:
     // list the phone app's Block button uses.
     Q_INVOKABLE void block(const QString &mac, const QString &name);
     Q_INVOKABLE void unblock(const QString &mac, const QString &name);
+    Q_INVOKABLE void copy(const QString &text);
 
 signals:
     void changed();

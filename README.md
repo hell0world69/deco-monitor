@@ -61,6 +61,7 @@ Speeds from the Deco are kilobits per second.
 | `S` | Sort by speed or name |
 | `↑` `↓` | Move through devices |
 | `B` | Block the selected device (asks first) |
+| `Menu` or `Shift+F10` | Device menu: Block, Unblock, copy IP or MAC (also right-click) |
 | `R` | Reboot all Deco units (asks first) |
 | `Esc` | Clear search, close dialogs |
 | `?` | Show shortcuts |
