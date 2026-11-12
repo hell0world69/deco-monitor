@@ -1,5 +1,7 @@
 # Deco Monitor
 
+![Deco Monitor](screenshot.png)
+
 Watch a TP-Link Deco mesh from an Omarchy desktop: total and per-device live
 speeds, every connected device, the Deco units and their internet status, and
 alerts when a new device joins. It can block and unblock devices (the same
@@ -19,20 +21,25 @@ phone app.
 | `deco` | Python CLI: logs in (RSA + AES, like the Deco web page), prints JSON. `deco watch` polls forever. |
 | `deco-monitor.service` | systemd user service running `deco watch 3`; writes `$XDG_RUNTIME_DIR/deco-monitor/status.json` and sends a notification for new devices. |
 | `decomon` | Qt Quick app reading that file. |
-| bar widget | `hell0world.deco-monitor` omarchy-shell plugin, also reading that file. |
+| bar widget | [omarchy-deco-monitor](https://github.com/hell0world69/omarchy-deco-monitor), an Omarchy shell plugin that also reads that file. |
 
 Only the service logs in: the Deco allows one local session at a time, so the
 app and the widget never fight over it.
 
 ## Setup
 
+Needs an Omarchy (Arch) system and a Deco in router mode at `192.168.68.1`.
+Tested with three XE75 Pro units on firmware 1.5.0.
+
 ```sh
+git clone https://github.com/hell0world69/deco-monitor.git ~/Work/deco-monitor
+cd ~/Work/deco-monitor
 # The Deco owner password (your TP-Link ID password), kept in the GNOME keyring
 secret-tool store --label='Deco router' service deco-monitor
 # The TP-Link ID email (needed for blocking; the SSH user is its SHA-1)
 secret-tool store --label='Deco TP-Link ID email' service deco-monitor-email
 
-bin/install                                   # builds and installs the package
+bin/install                                   # builds and installs the package (asks for sudo)
 systemctl --user enable --now deco-monitor    # start polling
 ```
 
@@ -70,3 +77,8 @@ Speeds from the Deco are kilobits per second.
 ## Development
 
 `bin/build`, `bin/test`, `bin/install`.
+
+## License
+
+MIT. Unofficial and not affiliated with TP-Link. The TMP framing follows
+[pydeco-tmp](https://github.com/mthsg/pydeco-tmp) (MIT).
