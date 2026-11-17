@@ -406,8 +406,29 @@ ApplicationWindow {
                             Layout.fillHeight: true
                             clip: true
                             spacing: 2
-                            model: win.visibleClients
                             focus: true
+                            // The device list is rebuilt on every status update
+                            // (every few seconds). Bound straight to the model
+                            // that would reset the view each time, jumping back
+                            // to the top and dropping the selection. So the new
+                            // list is swapped in by hand, and the row at the top
+                            // of the view and the selected device are put back.
+                            readonly property var source: win.visibleClients
+                            onSourceChanged: {
+                                const top = indexAt(1, contentY)
+                                const topItem = top >= 0 ? itemAtIndex(top) : null
+                                const offset = topItem ? contentY - topItem.y : 0
+                                const selected = currentIndex >= 0 && currentIndex < count && model[currentIndex] ? model[currentIndex].mac : ""
+                                model = source
+                                currentIndex = selected === "" ? (count > 0 ? 0 : -1)
+                                             : Math.max(0, source.findIndex(c => c.mac === selected))
+                                if (top >= 0 && count > 0) {
+                                    positionViewAtIndex(Math.min(top, count - 1), ListView.Beginning)
+                                    contentY += offset
+                                    returnToBounds()
+                                }
+                            }
+                            Component.onCompleted: model = source
                             keyNavigationEnabled: true
                             highlightMoveDuration: 0
                             ScrollBar.vertical: ScrollBar {}
