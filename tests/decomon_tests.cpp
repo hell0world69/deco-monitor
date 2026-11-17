@@ -101,6 +101,27 @@ private slots:
         QCOMPARE(backend.blocked().size(), 1);
     }
 
+    void parsesOfflineList()
+    {
+        QTemporaryDir dir;
+        Backend backend(dir.filePath("status.json"), "/bin/false");
+        backend.applyStatus(R"({"ok":true,"time":1,"offline":[
+            {"mac":"02-00-00-00-00-02","name":"Tablet","type":"Tablet","network":"main","last_online":900},
+            {"mac":"02-00-00-00-00-03","name":"Old phone","type":"Mobile","network":"iot","last_online":0}]})", 1);
+        QCOMPARE(backend.offline().size(), 2);
+        const QVariantMap first = backend.offline().first().toMap();
+        QCOMPARE(first.value("name").toString(), QString("Tablet"));
+        QCOMPARE(first.value("online").toBool(), false);
+        QCOMPARE(first.value("lastOnline").toLongLong(), 900);
+        QCOMPARE(first.value("ip").toString(), QString());
+        // A status from an older service, without the list, keeps the last one;
+        // an empty list clears it.
+        backend.applyStatus(R"({"ok":true,"time":2})", 2);
+        QCOMPARE(backend.offline().size(), 2);
+        backend.applyStatus(R"({"ok":true,"time":3,"offline":[]})", 3);
+        QCOMPARE(backend.offline().size(), 0);
+    }
+
     void blockReportsFailure()
     {
         QTemporaryDir dir;

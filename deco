@@ -12,6 +12,7 @@ Usage:
   deco raw PATH JSON    send an arbitrary request, e.g.
                         deco raw 'admin/device?form=device_list' '{"operation":"read"}'
   deco logout           drop the cached session
+  deco offline          devices the Deco remembers that are not connected now (JSON)
   deco blocked          devices on the Deco's blocked list (JSON)
   deco block MAC        block a device from the network (like the app's Block button)
   deco unblock MAC      take a device off the blocked list
@@ -503,6 +504,28 @@ def blocked_list(t):
     return out
 
 
+TMP_TYPES = {"pc": "Computer", "phone": "Mobile", "tablet": "Tablet", "iot_device": "IoT device"}
+
+
+def offline_list(t):
+    """Devices the Deco remembers (the phone app's client list) that are not
+    connected now, most recently online first."""
+    out = []
+    for c in (t.call(OP_CLIENTS) or {}).get("client_list", []):
+        if c.get("online", True) or not c.get("mac"):
+            continue
+        try:
+            last = int(c.get("access_time") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        custom = c.get("custom_client_type", "") if c.get("has_set_client_type") else ""
+        out.append({"mac": c["mac"], "name": b64name(c.get("name", "")) or c["mac"],
+                    "type": custom or TMP_TYPES.get(c.get("client_type", ""), ""),
+                    "network": c.get("interface", "main"), "last_online": last})
+    out.sort(key=lambda c: (-c["last_online"], c["name"].lower()))
+    return out
+
+
 def own_macs():
     """MACs of this computer, so it can't block itself by mistake."""
     macs = set()
@@ -668,6 +691,8 @@ def watch(interval):
     blocked_every = max(1, round(60 / interval))  # blocked list (TMP over SSH) every ~60s
     status["blocked"] = []
     status["blocked_error"] = ""
+    status["offline"] = []
+    offline = []  # as last read from the Deco; trimmed against who is online each tick
     tick = 0
     backoff = interval
     while True:
@@ -689,12 +714,17 @@ def watch(interval):
                     t = Tmp()
                     try:
                         status["blocked"] = blocked_list(t)
+                        offline = offline_list(t)
                         status["blocked_time"] = int(time.time())
                         status["blocked_error"] = ""
                     finally:
                         t.close()
                 except DecoError as e:
                     status["blocked_error"] = str(e)[:300]
+            # The offline list is read once a minute; a device that came
+            # back since then must not show as both online and offline.
+            online = {c["mac"] for c in cl}
+            status["offline"] = [o for o in offline if o["mac"] not in online]
             down = sum(c["down_kbps"] for c in cl)
             up = sum(c["up_kbps"] for c in cl)
             status.update(ok=True, error="", time=now, clients=cl, down_kbps=down, up_kbps=up,
@@ -756,10 +786,10 @@ def main(argv):
             t.close()
         patch_status_blocked(blk)
         r = {"ok": True, "blocked": blk}
-    elif cmd == "blocked":
+    elif cmd in ("blocked", "offline"):
         t = Tmp()
         try:
-            r = blocked_list(t)
+            r = blocked_list(t) if cmd == "blocked" else offline_list(t)
         finally:
             t.close()
     elif cmd == "trust":

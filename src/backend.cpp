@@ -125,6 +125,29 @@ void Backend::applyStatus(const QByteArray &json, qint64 now) {
         }
     }
 
+    // Devices the Deco remembers that aren't connected now. Shaped like a
+    // client so the device list and its menu can treat both the same way.
+    if (d.contains("offline")) {
+        m_offline.clear();
+        const QJsonArray off = d.value("offline").toArray();
+        for (int i = 0; i < off.size() && i < 512; ++i) {
+            const QJsonObject o = off.at(i).toObject();
+            m_offline.append(QVariantMap{
+                {"name", clip(o.value("name"), 64)},
+                {"mac", clip(o.value("mac"), 20)},
+                {"ip", QString()},
+                {"connection", QString()},
+                {"network", clip(o.value("network"), 16)},
+                {"type", clip(o.value("type"), 24)},
+                {"down", 0.0},
+                {"up", 0.0},
+                {"online", false},
+                {"isNew", false},
+                {"lastOnline", qint64(positive(o.value("last_online")))},
+            });
+        }
+    }
+
     if (ok) {
         m_down = positive(d.value("down_kbps"));
         m_up = positive(d.value("up_kbps"));

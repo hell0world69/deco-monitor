@@ -29,6 +29,7 @@ class Backend : public QObject {
     Q_PROPERTY(QString rebootMessage READ rebootMessage NOTIFY rebootingChanged)
     Q_PROPERTY(QVariantList blocked READ blocked NOTIFY changed)
     Q_PROPERTY(QString blockedError READ blockedError NOTIFY changed)
+    Q_PROPERTY(QVariantList offline READ offline NOTIFY changed)
     Q_PROPERTY(bool blockedKnown READ blockedKnown NOTIFY changed)
     Q_PROPERTY(bool blocking READ blocking NOTIFY blockingChanged)
     Q_PROPERTY(QString blockMessage READ blockMessage NOTIFY blockingChanged)
@@ -56,6 +57,7 @@ public:
     QString rebootMessage() const { return m_rebootMessage; }
     QVariantList blocked() const { return m_blocked; }
     QString blockedError() const { return m_blockedError; }
+    QVariantList offline() const { return m_offline; }
     bool blockedKnown() const { return m_blockedKnown; }
     bool blocking() const { return m_block.state() != QProcess::NotRunning; }
     QString blockMessage() const { return m_blockMessage; }
@@ -98,6 +100,7 @@ private:
     qint64 m_updated = 0;
     QString m_rebootMessage;
     QVariantList m_blocked;
+    QVariantList m_offline;
     QString m_blockedError;
     bool m_blockedKnown = false;
     QString m_blockMessage;

@@ -4,7 +4,8 @@
 
 Watch a TP-Link Deco mesh from an Omarchy desktop: total and per-device live
 speeds, every connected device, the Deco units and their internet status, and
-alerts when a new device joins. It can block and unblock devices (the same
+alerts when a new device joins. Devices the Deco remembers but that aren't
+connected now are listed too, with when they were last online. It can block and unblock devices (the same
 blocked list as the phone app's Block button) and reboot Deco units.
 
 It talks to the Deco's own local web API (the one behind http://192.168.68.1),
@@ -61,6 +62,7 @@ address), and asks before replacing the key. The old one is kept as
 deco status | clients | nodes | wan     JSON snapshots
 deco reboot [MAC...]                    reboot all Deco units, or the given ones
 deco blocked | block MAC | unblock MAC  the blocked list (block refuses this computer)
+deco offline                            devices the Deco remembers that are not connected now
 deco trust [--yes]                      accept the Deco's SSH host key after it changed
 deco raw 'admin/device?form=device_list' '{"operation":"read"}'
 ```
@@ -73,6 +75,7 @@ Speeds from the Deco are kilobits per second.
 |---|---|
 | `/` or `Ctrl+F` | Search devices |
 | `Space` | Show or hide idle devices |
+| `O` | Show or hide offline devices (the ones the Deco remembers, with when they were last online) |
 | `S` | Sort by connection (Wired, 6 GHz, 5 GHz, 2.4 GHz; the default), name, or speed |
 | `↑` `↓` | Move through devices |
 | `B` | Block the selected device (asks first) |

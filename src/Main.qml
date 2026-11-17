@@ -31,6 +31,7 @@ ApplicationWindow {
 
     property bool helpVisible: false
     property bool showIdle: true
+    property bool showOffline: true
     // "connection" keeps the list steady: grouped Wired, 6 GHz, 5 GHz,
     // 2.4 GHz, then anything else, and alphabetical inside each group, so rows
     // don't jump around as speeds change. S cycles to name and speed.
@@ -75,7 +76,32 @@ ApplicationWindow {
         return qsTr("%1 min ago").arg(Math.round(s / 60))
     }
 
-    readonly property var visibleClients: {
+    // When a device was last on the network; "" when the Deco doesn't say.
+    function lastOnline(seconds) {
+        if (!(seconds > 0)) return ""
+        const s = Math.max(0, Math.round(Date.now() / 1000 - seconds))
+        if (s < 3600) return qsTr("Last online %1 min ago").arg(Math.max(1, Math.round(s / 60)))
+        if (s < 2 * 86400) return qsTr("Last online %1 h ago").arg(Math.round(s / 3600))
+        return qsTr("Last online %1 days ago").arg(Math.round(s / 86400))
+    }
+
+    // Devices the Deco remembers that aren't connected now. Blocked ones are
+    // left out: they have their own list beside this one.
+    readonly property var offlineClients: {
+        const q = search.text.trim().toLowerCase()
+        let list = backend.offline.filter(c => {
+            if (win.isBlocked(c.mac)) return false
+            if (!q) return true
+            return (c.name + " " + c.mac + " " + c.type).toLowerCase().indexOf(q) >= 0
+        })
+        // The service sends them most recently online first.
+        if (win.sortMode === "name")
+            list = list.slice().sort(win.byName)
+        return list
+    }
+    // Online devices first, then (unless hidden with O) the offline ones.
+    readonly property var visibleClients: win.showOffline ? win.onlineClients.concat(win.offlineClients) : win.onlineClients
+    readonly property var onlineClients: {
         translator.language
         const q = search.text.trim().toLowerCase()
         let list = backend.clients.filter(c => {
@@ -97,6 +123,7 @@ ApplicationWindow {
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; onActivated: win.helpVisible = !win.helpVisible }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: Qt.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.showIdle = !win.showIdle }
+    Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.showOffline = !win.showOffline }
     Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !search.activeFocus; onActivated: win.sortMode = win.sortMode === "connection" ? "name" : win.sortMode === "name" ? "speed" : "connection" }
     Shortcut { sequence: "/"; context: Qt.ApplicationShortcut; onActivated: search.forceActiveFocus() }
     Shortcut {
@@ -325,7 +352,7 @@ ApplicationWindow {
                                 color: win.fg; font.bold: true; font.pixelSize: 16
                             }
                             Label {
-                                text: (win.showIdle ? "" : qsTr("active only") + " · ") + (win.sortMode === "connection" ? qsTr("by connection") : win.sortMode === "name" ? qsTr("by name") : qsTr("by speed"))
+                                text: (win.showIdle ? "" : qsTr("active only") + " · ") + (win.showOffline ? "" : qsTr("offline hidden") + " · ") + (win.sortMode === "connection" ? qsTr("by connection") : win.sortMode === "name" ? qsTr("by name") : qsTr("by speed"))
                                 color: win.muted; font.pixelSize: 12
                                 Layout.leftMargin: 8
                             }
@@ -385,16 +412,37 @@ ApplicationWindow {
                             highlightMoveDuration: 0
                             ScrollBar.vertical: ScrollBar {}
 
-                            delegate: Rectangle {
+                            delegate: Item {
                                 id: row
                                 required property var modelData
                                 required property int index
                                 width: ListView.view.width
+                                height: 46 + (firstOffline ? offlineHeading.height : 0)
+                                readonly property bool busy: modelData.down + modelData.up >= 1000
+                                readonly property bool offline: modelData.online === false
+                                readonly property bool current: ListView.isCurrentItem
+                                // The first offline row carries the heading for the whole group.
+                                readonly property bool firstOffline: offline && index === win.onlineClients.length
+
+                                Label {
+                                    id: offlineHeading
+                                    visible: row.firstOffline
+                                    width: parent.width
+                                    height: 34
+                                    leftPadding: 10
+                                    verticalAlignment: Text.AlignBottom
+                                    bottomPadding: 6
+                                    text: qsTr("Offline · %1").arg(win.offlineClients.length)
+                                    color: win.muted
+                                    font.pixelSize: 11; font.bold: true; font.letterSpacing: 1.2
+                                }
+
+                                Rectangle {
+                                anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
                                 height: 46
                                 radius: win.smallRadius
-                                color: ListView.isCurrentItem && list.activeFocus ? Qt.rgba(1, 1, 1, 0.06)
+                                color: row.current && list.activeFocus ? Qt.rgba(1, 1, 1, 0.06)
                                      : hover.hovered ? Qt.rgba(1, 1, 1, 0.035) : "transparent"
-                                readonly property bool busy: modelData.down + modelData.up >= 1000
                                 HoverHandler { id: hover }
                                 TapHandler { onTapped: list.currentIndex = row.index }
                                 TapHandler {
@@ -412,7 +460,9 @@ ApplicationWindow {
                                         spacing: 8
                                         Rectangle {
                                             width: 7; height: 7; radius: 3.5
-                                            color: row.busy ? theme.accent : Qt.rgba(1, 1, 1, 0.18)
+                                            color: row.offline ? "transparent" : row.busy ? theme.accent : Qt.rgba(1, 1, 1, 0.18)
+                                            border.width: row.offline ? 1 : 0
+                                            border.color: Qt.rgba(1, 1, 1, 0.25)
                                         }
                                         ColumnLayout {
                                             Layout.fillWidth: true
@@ -421,15 +471,16 @@ ApplicationWindow {
                                                 Layout.fillWidth: true
                                                 textFormat: Text.PlainText
                                                 text: row.modelData.name
-                                                color: win.fg
+                                                color: row.offline ? win.muted : win.fg
                                                 elide: Text.ElideRight
                                             }
                                             Label {
                                                 Layout.fillWidth: true
                                                 textFormat: Text.PlainText
                                                 visible: text !== ""
-                                                text: [row.modelData.type, win.wide ? "" : row.modelData.ip, win.wide ? "" : row.modelData.connection,
-                                                       row.modelData.network === "guest" ? qsTr("Guest network") : ""].filter(s => s).join(" · ")
+                                                text: { clock.minute; return [row.modelData.type, win.wide ? "" : row.modelData.ip, win.wide ? "" : row.modelData.connection,
+                                                       row.modelData.network === "guest" ? qsTr("Guest network") : "",
+                                                       row.offline ? win.lastOnline(row.modelData.lastOnline) : ""].filter(s => s).join(" · ") }
                                                 color: win.muted
                                                 font.pixelSize: 11
                                                 elide: Text.ElideRight
@@ -462,13 +513,13 @@ ApplicationWindow {
                                         Layout.preferredWidth: 80
                                         visible: win.wide
                                         textFormat: Text.PlainText
-                                        text: row.modelData.connection
+                                        text: row.offline ? qsTr("Offline") : row.modelData.connection
                                         color: win.muted
                                     }
                                     Label {
                                         Layout.preferredWidth: 90
                                         horizontalAlignment: Text.AlignRight
-                                        text: win.speed(row.modelData.down)
+                                        text: row.offline ? "" : win.speed(row.modelData.down)
                                         color: row.busy ? win.fg : win.muted
                                         font.bold: row.modelData.down >= 1000
                                         font.features: { "tnum": 1 }
@@ -476,7 +527,7 @@ ApplicationWindow {
                                     Label {
                                         Layout.preferredWidth: 90
                                         horizontalAlignment: Text.AlignRight
-                                        text: win.speed(row.modelData.up)
+                                        text: row.offline ? "" : win.speed(row.modelData.up)
                                         color: row.busy ? win.fg : win.muted
                                         font.features: { "tnum": 1 }
                                     }
@@ -487,13 +538,14 @@ ApplicationWindow {
                                         text: "⊘"
                                         font.pixelSize: 16
                                         // Shown on hover or selection; never for this computer.
-                                        opacity: (hover.hovered || (row.ListView.isCurrentItem && list.activeFocus)) && !win.isOwn(row.modelData.mac) ? 1 : 0
+                                        opacity: (hover.hovered || (row.current && list.activeFocus)) && !win.isOwn(row.modelData.mac) ? 1 : 0
                                         enabled: opacity > 0 && !backend.blocking
                                         Material.foreground: win.danger
                                         ToolTip.visible: hovered && enabled
                                         ToolTip.text: qsTr("Block %1  (B)").arg(row.modelData.name)
                                         onClicked: win.askBlock(row.modelData)
                                     }
+                                }
                                 }
                             }
 
@@ -862,6 +914,7 @@ ApplicationWindow {
                         model: [
                             ["/", qsTr("Search devices")],
                             ["Space", qsTr("Show or hide idle devices")],
+                            ["O", qsTr("Show or hide offline devices")],
                             ["S", qsTr("Sort by connection, name or speed")],
                             ["↑ ↓", qsTr("Move through devices")],
                             ["B", qsTr("Block the selected device")],
@@ -889,6 +942,7 @@ ApplicationWindow {
         }
     }
 
-    // Keeps "Updated n s ago" moving between status updates.
-    Timer { id: clock; property int tick: 0; interval: 1000; repeat: true; running: true; onTriggered: tick++ }
+    // Keeps "Updated n s ago" moving between status updates;
+    // "minute" does the same for the offline rows' "Last online" text.
+    Timer { id: clock; property int tick: 0; readonly property int minute: Math.floor(tick / 60); interval: 1000; repeat: true; running: true; onTriggered: tick++ }
 }
