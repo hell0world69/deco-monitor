@@ -48,12 +48,20 @@ systemctl --user enable --now deco-monitor    # start polling
 The Deco locks SSH logins for two hours after ten failures, so after one failed
 TMP login `deco` refuses to try again for two hours.
 
+`deco` pins the Deco's SSH host key on first use. If the Deco later presents a
+different key (a reboot or firmware update can do that), the blocked list stops
+with "the Deco's SSH host key changed". `deco trust` shows the pinned and the
+new fingerprint, checks that the address still belongs to the main Deco (by MAC
+address), and asks before replacing the key. The old one is kept as
+`~/.local/state/deco-monitor/known_hosts.old`.
+
 ## Commands
 
 ```
 deco status | clients | nodes | wan     JSON snapshots
 deco reboot [MAC...]                    reboot all Deco units, or the given ones
 deco blocked | block MAC | unblock MAC  the blocked list (block refuses this computer)
+deco trust [--yes]                      accept the Deco's SSH host key after it changed
 deco raw 'admin/device?form=device_list' '{"operation":"read"}'
 ```
 

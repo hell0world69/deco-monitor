@@ -15,6 +15,8 @@ Usage:
   deco blocked          devices on the Deco's blocked list (JSON)
   deco block MAC        block a device from the network (like the app's Block button)
   deco unblock MAC      take a device off the blocked list
+  deco trust [--yes]    accept the Deco's SSH host key after it changed (a Deco reboot or
+                        firmware update can do that); shows old and new fingerprints first
   deco tmp OPCODE [JSON --write] [--force]
                         talk the phone app's local protocol (SSH port 20001);
                         needs the TP-Link ID email in the keyring (service deco-monitor-email)
@@ -279,6 +281,9 @@ class Tmp:
                 with open(TMP_FAIL, "w") as f:
                     f.write(err)
                 raise DecoError("TMP login refused: " + err.strip().splitlines()[-1][:200])
+            if "HOST IDENTIFICATION HAS CHANGED" in err:
+                raise DecoError("the Deco's SSH host key changed (a Deco reboot or firmware update "
+                                "can do that). Check and accept the new key with: deco trust")
             raise DecoError(f"{e}; ssh: {err.strip()[:300]}")
         try:
             os.unlink(TMP_FAIL)
@@ -393,6 +398,94 @@ class Tmp:
 # TMP_APPV2_OP_BLOCKED_LIST_UNBLOCK 0x4019 takes ClientUnblockParams
 #   {"client_list": ["<mac>"]}.
 OP_CLIENTS, OP_BLOCK, OP_BLOCKED, OP_UNBLOCK = 0x4012, 0x4017, 0x4018, 0x4019
+
+
+def _fingerprints(keys: str) -> dict:
+    """{key type: 'BITS SHA256:...'} for known_hosts-format lines."""
+    if not keys.strip():
+        return {}
+    r = subprocess.run(["ssh-keygen", "-lf", "-"], input=keys, capture_output=True, text=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 4:
+            out[f[-1].strip("()")] = f"{f[0]} {f[1]}"
+    return out
+
+
+def _neighbour_mac(host):
+    """MAC address this computer sees at host, or None."""
+    try:
+        r = subprocess.run(["ip", "neigh", "show", host], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    macs = {f[f.index("lladdr") + 1].upper().replace(":", "-")
+            for f in (l.split() for l in r.stdout.splitlines()) if "lladdr" in f}
+    return macs.pop() if len(macs) == 1 else None
+
+
+def trust(d, yes=False, force=False):
+    """Replace the pinned SSH host key of the Deco with the one it presents now."""
+    say = lambda *a: print(*a, file=sys.stderr)
+    try:
+        scan = subprocess.run(["ssh-keyscan", "-p", "20001", "-T", "8", HOST],
+                              capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise DecoError(f"could not read the Deco's SSH host key: {e}")
+    live_keys = "".join(l + "\n" for l in scan.splitlines() if l and not l.startswith("#"))
+    live = _fingerprints(live_keys)
+    if not live:
+        raise DecoError(f"no SSH host key from {HOST} port 20001 (is the Deco reachable?)")
+    try:
+        with open(TMP_KNOWN_HOSTS) as f:
+            old_keys = f.read()
+    except OSError:
+        old_keys = ""
+    old = _fingerprints(old_keys)
+    if old and all(live.get(t) == fp for t, fp in old.items()):
+        say(f"The Deco's SSH host key is unchanged ({', '.join(old.values())}). Nothing to do.")
+        return {"ok": True, "changed": False, "fingerprints": old}
+
+    # Is the thing answering at HOST really the main Deco? Compare the MAC this
+    # computer sees there with the main unit's MAC from the Deco's web API.
+    seen = _neighbour_mac(HOST)
+    try:
+        master = next((n["mac"].upper().replace(":", "-") for n in nodes(d) if n.get("role") == "master"), None)
+    except (DecoError, OSError):
+        master = None
+    say(f"Deco at {HOST}, SSH port 20001")
+    for t in sorted(set(old) | set(live)):
+        say(f"  {t:8} pinned: {old.get(t, '(none)')}")
+        say(f"  {'':8} now:    {live.get(t, '(not offered)')}")
+    if seen and master and seen == master:
+        say(f"  MAC at {HOST} is {seen}, which is the main Deco. Good.")
+    elif seen and master:
+        say(f"  WARNING: MAC at {HOST} is {seen} but the main Deco is {master}.")
+        if not force:
+            raise DecoError("the device answering is not the main Deco; not trusting its key "
+                            "(use --force if you are sure)")
+    else:
+        say("  Could not confirm that this is the main Deco (no MAC to compare).")
+        if yes and not force:
+            raise DecoError("could not confirm this is the main Deco; run deco trust without "
+                            "--yes to decide yourself, or add --force")
+    if not yes:
+        if not sys.stdin.isatty():
+            raise DecoError("deco trust needs a terminal to ask, or --yes")
+        say("Trust the new key? [y/N] ", end="")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            raise DecoError("not trusted; nothing changed")
+    os.makedirs(os.path.dirname(TMP_KNOWN_HOSTS), exist_ok=True)
+    if old_keys:
+        with open(TMP_KNOWN_HOSTS + ".old", "w") as f:
+            f.write(old_keys)
+    tmp = TMP_KNOWN_HOSTS + ".new"
+    with open(tmp, "w") as f:
+        f.write(live_keys)
+    os.replace(tmp, TMP_KNOWN_HOSTS)
+    say("Trusted. The service picks it up on its next check (about a minute).")
+    return {"ok": True, "changed": True, "fingerprints": live}
 
 
 def norm_mac(mac):
@@ -669,6 +762,8 @@ def main(argv):
             r = blocked_list(t)
         finally:
             t.close()
+    elif cmd == "trust":
+        r = trust(d, yes="--yes" in argv or "-y" in argv, force="--force" in argv)
     elif cmd == "tmp" and len(argv) >= 3:
         # deco tmp OPCODE            read (e.g. 0x4018)
         # deco tmp OPCODE JSON --write   write params (changes the Deco)
