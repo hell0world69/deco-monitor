@@ -91,5 +91,6 @@ Speeds from the Deco are kilobits per second.
 
 ## License
 
-MIT. Unofficial and not affiliated with TP-Link. The TMP framing follows
+MIT. Unofficial and not affiliated with TP-Link. The app icon is the TP-Link logo, a
+trademark of TP-Link, used only to show what the app is for. The TMP framing follows
 [pydeco-tmp](https://github.com/mthsg/pydeco-tmp) (MIT).
